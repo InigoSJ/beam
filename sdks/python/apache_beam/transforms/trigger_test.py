@@ -19,25 +19,20 @@
 
 # pytype: skip-file
 
-from __future__ import absolute_import
-
 import collections
 import json
 import os.path
 import pickle
 import random
 import unittest
-from builtins import range
-from builtins import zip
 
-# patches unittest.TestCase to be python3 compatible
-import future.tests.base  # pylint: disable=unused-import
 import yaml
 
 import apache_beam as beam
 from apache_beam import coders
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.options.pipeline_options import StandardOptions
+from apache_beam.options.pipeline_options import TypeOptions
 from apache_beam.portability import common_urns
 from apache_beam.runners import pipeline_context
 from apache_beam.runners.direct.clock import TestClock
@@ -45,6 +40,7 @@ from apache_beam.testing.test_pipeline import TestPipeline
 from apache_beam.testing.test_stream import TestStream
 from apache_beam.testing.util import assert_that
 from apache_beam.testing.util import equal_to
+from apache_beam.transforms import WindowInto
 from apache_beam.transforms import ptransform
 from apache_beam.transforms import trigger
 from apache_beam.transforms.core import Windowing
@@ -56,6 +52,7 @@ from apache_beam.transforms.trigger import AfterEach
 from apache_beam.transforms.trigger import AfterProcessingTime
 from apache_beam.transforms.trigger import AfterWatermark
 from apache_beam.transforms.trigger import Always
+from apache_beam.transforms.trigger import DataLossReason
 from apache_beam.transforms.trigger import DefaultTrigger
 from apache_beam.transforms.trigger import GeneralTriggerDriver
 from apache_beam.transforms.trigger import InMemoryUnmergedState
@@ -63,6 +60,7 @@ from apache_beam.transforms.trigger import Repeatedly
 from apache_beam.transforms.trigger import TriggerFn
 from apache_beam.transforms.trigger import _Never
 from apache_beam.transforms.window import FixedWindows
+from apache_beam.transforms.window import GlobalWindows
 from apache_beam.transforms.window import IntervalWindow
 from apache_beam.transforms.window import Sessions
 from apache_beam.transforms.window import TimestampCombiner
@@ -439,6 +437,92 @@ class TriggerTest(unittest.TestCase):
           pickle.loads(pickle.dumps(unwindowed)).value, list(range(10)))
 
 
+class MayLoseDataTest(unittest.TestCase):
+  def _test(self, trigger, lateness, expected):
+    windowing = WindowInto(
+        GlobalWindows(),
+        trigger=trigger,
+        accumulation_mode=AccumulationMode.ACCUMULATING,
+        allowed_lateness=lateness).windowing
+    self.assertEqual(trigger.may_lose_data(windowing), expected)
+
+  def test_default_trigger(self):
+    self._test(DefaultTrigger(), 0, DataLossReason.NO_POTENTIAL_LOSS)
+
+  def test_after_processing(self):
+    self._test(AfterProcessingTime(42), 0, DataLossReason.MAY_FINISH)
+
+  def test_always(self):
+    self._test(Always(), 0, DataLossReason.NO_POTENTIAL_LOSS)
+
+  def test_never(self):
+    self._test(_Never(), 0, DataLossReason.NO_POTENTIAL_LOSS)
+
+  def test_after_watermark_no_allowed_lateness(self):
+    self._test(AfterWatermark(), 0, DataLossReason.NO_POTENTIAL_LOSS)
+
+  def test_after_watermark_no_late_trigger(self):
+    self._test(AfterWatermark(), 60, DataLossReason.MAY_FINISH)
+
+  def test_after_watermark_no_allowed_lateness_safe_late(self):
+    self._test(
+        AfterWatermark(late=DefaultTrigger()),
+        0,
+        DataLossReason.NO_POTENTIAL_LOSS)
+
+  def test_after_watermark_allowed_lateness_safe_late(self):
+    self._test(
+        AfterWatermark(late=DefaultTrigger()),
+        60,
+        DataLossReason.NO_POTENTIAL_LOSS)
+
+  def test_after_count(self):
+    self._test(AfterCount(42), 0, DataLossReason.MAY_FINISH)
+
+  def test_repeatedly_safe_underlying(self):
+    self._test(
+        Repeatedly(DefaultTrigger()), 0, DataLossReason.NO_POTENTIAL_LOSS)
+
+  def test_repeatedly_unsafe_underlying(self):
+    self._test(Repeatedly(AfterCount(42)), 0, DataLossReason.NO_POTENTIAL_LOSS)
+
+  def test_after_any_one_may_finish(self):
+    self._test(
+        AfterAny(AfterCount(42), DefaultTrigger()),
+        0,
+        DataLossReason.MAY_FINISH)
+
+  def test_after_any_all_safe(self):
+    self._test(
+        AfterAny(Repeatedly(AfterCount(42)), DefaultTrigger()),
+        0,
+        DataLossReason.NO_POTENTIAL_LOSS)
+
+  def test_after_all_some_may_finish(self):
+    self._test(
+        AfterAll(AfterCount(1), DefaultTrigger()),
+        0,
+        DataLossReason.NO_POTENTIAL_LOSS)
+
+  def test_afer_all_all_may_finish(self):
+    self._test(
+        AfterAll(AfterCount(42), AfterProcessingTime(42)),
+        0,
+        DataLossReason.MAY_FINISH)
+
+  def test_after_each_at_least_one_safe(self):
+    self._test(
+        AfterEach(AfterCount(1), DefaultTrigger(), AfterCount(2)),
+        0,
+        DataLossReason.NO_POTENTIAL_LOSS)
+
+  def test_after_each_all_may_finish(self):
+    self._test(
+        AfterEach(AfterCount(1), AfterCount(2), AfterCount(3)),
+        0,
+        DataLossReason.MAY_FINISH)
+
+
 class RunnerApiTest(unittest.TestCase):
   def test_trigger_encoding(self):
     for trigger_fn in (DefaultTrigger(),
@@ -456,26 +540,109 @@ class RunnerApiTest(unittest.TestCase):
 
 
 class TriggerPipelineTest(unittest.TestCase):
+  def test_after_processing_time(self):
+    test_options = PipelineOptions(
+        flags=['--allow_unsafe_triggers', '--streaming'])
+    with TestPipeline(options=test_options) as p:
+
+      total_elements_in_trigger = 4
+      processing_time_delay = 2
+      window_size = 10
+
+      # yapf: disable
+      test_stream = TestStream()
+      for i in range(total_elements_in_trigger):
+        (test_stream
+         .advance_processing_time(processing_time_delay / total_elements_in_trigger )
+         .add_elements([('key', i)])
+         )
+
+      test_stream.advance_processing_time(processing_time_delay)
+
+      # Add dropped elements
+      (test_stream
+         .advance_processing_time(0.1)
+         .add_elements([('key', "dropped-1")])
+         .advance_processing_time(0.1)
+         .add_elements([('key', "dropped-2")])
+      )
+
+      (test_stream
+       .advance_processing_time(processing_time_delay)
+       .advance_watermark_to_infinity()
+       )
+      # yapf: enable
+
+      results = (
+          p
+          | test_stream
+          | beam.WindowInto(
+              FixedWindows(window_size),
+              trigger=AfterProcessingTime(processing_time_delay),
+              accumulation_mode=AccumulationMode.DISCARDING)
+          | beam.GroupByKey()
+          | beam.Map(lambda x: x[1]))
+
+      assert_that(results, equal_to([list(range(total_elements_in_trigger))]))
+
+  def test_repeatedly_after_processing_time(self):
+    test_options = PipelineOptions(flags=['--streaming'])
+    with TestPipeline(options=test_options) as p:
+      total_elements = 8
+      processing_time_delay = 2
+      window_size = 10
+      # yapf: disable
+      test_stream = TestStream()
+      for i in range(total_elements):
+        (test_stream
+         .advance_processing_time(processing_time_delay - 0.01)
+         .add_elements([('key', i)])
+         )
+
+      (test_stream
+       .advance_processing_time(processing_time_delay)
+       .advance_watermark_to_infinity()
+       )
+      # yapf: enable
+
+      results = (
+          p
+          | test_stream
+          | beam.WindowInto(
+              FixedWindows(window_size),
+              trigger=Repeatedly(AfterProcessingTime(processing_time_delay)),
+              accumulation_mode=AccumulationMode.DISCARDING)
+          | beam.GroupByKey()
+          | beam.Map(lambda x: x[1]))
+
+      expected = [[i, i + 1]
+                  for i in range(total_elements - total_elements % 2)
+                  if i % 2 == 0]
+      expected += [] if total_elements % 2 == 0 else [[total_elements - 1]]
+
+      assert_that(results, equal_to(expected))
+
   def test_after_count(self):
-    with TestPipeline() as p:
+    test_options = PipelineOptions(flags=['--allow_unsafe_triggers'])
+    with TestPipeline(options=test_options) as p:
 
-      def construct_timestamped(k_t):
-        return TimestampedValue((k_t[0], k_t[1]), k_t[1])
+      def construct_timestamped(k, t):
+        return TimestampedValue((k, t), t)
 
-      def format_result(k_v):
-        return ('%s-%s' % (k_v[0], len(k_v[1])), set(k_v[1]))
+      def format_result(k, vs):
+        return ('%s-%s' % (k, len(list(vs))), set(vs))
 
       result = (
           p
           | beam.Create([1, 2, 3, 4, 5, 10, 11])
           | beam.FlatMap(lambda t: [('A', t), ('B', t + 5)])
-          | beam.Map(construct_timestamped)
+          | beam.MapTuple(construct_timestamped)
           | beam.WindowInto(
               FixedWindows(10),
               trigger=AfterCount(3),
               accumulation_mode=AccumulationMode.DISCARDING)
           | beam.GroupByKey()
-          | beam.Map(format_result))
+          | beam.MapTuple(format_result))
       assert_that(
           result,
           equal_to(
@@ -486,26 +653,55 @@ class TriggerPipelineTest(unittest.TestCase):
                   'B-3': {10, 15, 16},
               }.items())))
 
+  def test_after_count_streaming(self):
+    test_options = PipelineOptions(
+        flags=['--allow_unsafe_triggers', '--streaming'])
+    with TestPipeline(options=test_options) as p:
+      # yapf: disable
+      test_stream = (
+          TestStream()
+          .advance_watermark_to(0)
+          .add_elements([('A', 1), ('A', 2), ('A', 3)])
+          .add_elements([('A', 4), ('A', 5), ('A', 6)])
+          .add_elements([('B', 1), ('B', 2), ('B', 3)])
+          .advance_watermark_to_infinity())
+      # yapf: enable
+
+      results = (
+          p
+          | test_stream
+          | beam.WindowInto(
+              FixedWindows(10),
+              trigger=AfterCount(3),
+              accumulation_mode=AccumulationMode.ACCUMULATING)
+          | beam.GroupByKey())
+
+      assert_that(
+          results,
+          equal_to(list({
+            'A': [1, 2, 3], # 4 - 6 discarded because trigger finished
+            'B': [1, 2, 3]}.items())))
+
   def test_always(self):
     with TestPipeline() as p:
 
-      def construct_timestamped(k_t):
-        return TimestampedValue((k_t[0], k_t[1]), k_t[1])
+      def construct_timestamped(k, t):
+        return TimestampedValue((k, t), t)
 
-      def format_result(k_v):
-        return ('%s-%s' % (k_v[0], len(k_v[1])), set(k_v[1]))
+      def format_result(k, vs):
+        return ('%s-%s' % (k, len(list(vs))), set(vs))
 
       result = (
           p
           | beam.Create([1, 1, 2, 3, 4, 5, 10, 11])
           | beam.FlatMap(lambda t: [('A', t), ('B', t + 5)])
-          | beam.Map(construct_timestamped)
+          | beam.MapTuple(construct_timestamped)
           | beam.WindowInto(
               FixedWindows(10),
               trigger=Always(),
               accumulation_mode=AccumulationMode.DISCARDING)
           | beam.GroupByKey()
-          | beam.Map(format_result))
+          | beam.MapTuple(format_result))
       assert_that(
           result,
           equal_to(
@@ -522,23 +718,23 @@ class TriggerPipelineTest(unittest.TestCase):
   def test_never(self):
     with TestPipeline() as p:
 
-      def construct_timestamped(k_t):
-        return TimestampedValue((k_t[0], k_t[1]), k_t[1])
+      def construct_timestamped(k, t):
+        return TimestampedValue((k, t), t)
 
-      def format_result(k_v):
-        return ('%s-%s' % (k_v[0], len(k_v[1])), set(k_v[1]))
+      def format_result(k, vs):
+        return ('%s-%s' % (k, len(list(vs))), set(vs))
 
       result = (
           p
           | beam.Create([1, 1, 2, 3, 4, 5, 10, 11])
           | beam.FlatMap(lambda t: [('A', t), ('B', t + 5)])
-          | beam.Map(construct_timestamped)
+          | beam.MapTuple(construct_timestamped)
           | beam.WindowInto(
               FixedWindows(10),
               trigger=_Never(),
               accumulation_mode=AccumulationMode.DISCARDING)
           | beam.GroupByKey()
-          | beam.Map(format_result))
+          | beam.MapTuple(format_result))
       assert_that(
           result,
           equal_to(
@@ -583,7 +779,7 @@ class TriggerPipelineTest(unittest.TestCase):
 
   def test_on_pane_watermark_hold_no_pipeline_stall(self):
     """A regression test added for
-    https://issues.apache.org/jira/browse/BEAM-10054."""
+    ttps://issues.apache.org/jira/browse/BEAM-10054."""
     START_TIMESTAMP = 1534842000
 
     test_stream = TestStream()
@@ -594,7 +790,8 @@ class TriggerPipelineTest(unittest.TestCase):
     test_stream.advance_processing_time(START_TIMESTAMP + 2)
     test_stream.advance_watermark_to(START_TIMESTAMP + 2)
 
-    with TestPipeline(options=PipelineOptions(['--streaming'])) as p:
+    with TestPipeline(options=PipelineOptions(
+        ['--streaming', '--allow_unsafe_triggers'])) as p:
       # pylint: disable=expression-not-assigned
       (
           p
@@ -928,7 +1125,8 @@ class BaseTestStreamTranscriptTest(TranscriptTest):
 
     # Elements are encoded as a json strings to allow other languages to
     # decode elements while executing the test stream.
-    # TODO(BEAM-8600): Eliminate these gymnastics.
+    # TODO(https://github.com/apache/beam/issues/19934): Eliminate these
+    # gymnastics.
     test_stream = TestStream(coder=coders.StrUtf8Coder()).with_output_types(str)
     for action, params in transcript:
       if action == 'expect':
@@ -1065,8 +1263,10 @@ class BaseTestStreamTranscriptTest(TranscriptTest):
        | beam.ParDo(Check(self.allow_out_of_order)))
 
     with TestPipeline() as p:
-      # TODO(BEAM-8601): Pass this during pipeline construction.
+      # TODO(https://github.com/apache/beam/issues/19933): Pass this during
+      # pipeline construction.
       p._options.view_as(StandardOptions).streaming = True
+      p._options.view_as(TypeOptions).allow_unsafe_triggers = True
 
       # We can have at most one test stream per pipeline, so we share it.
       inputs_and_expected = p | read_test_stream
